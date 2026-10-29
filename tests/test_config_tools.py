@@ -22,7 +22,7 @@ class FakeLab:
     """Pretends to be docker exec ... vtysh / ip for three routers."""
 
     def __init__(self):
-        self.devices = {n: {"hostname": n, "ifaces": {"eth1": {"desc": None, "down": False},
+        self.devices = {n: {"hostname": n, "frr_hostname": n, "ifaces": {"eth1": {"desc": None, "down": False},
                                                        "eth2": {"desc": None, "down": False}}}
                         for n in ("spine1", "leaf1", "leaf2")}
         self.ignore_changes = False     # accept commands but do nothing (read-back will mismatch)
@@ -32,7 +32,7 @@ class FakeLab:
 
     def _config_text(self, d):
         out = ["Building configuration...", "", "Current configuration:", "!", "frr version 10.2.1",
-               "frr defaults traditional", f"hostname {d['hostname']}", "log stdout", "!"]
+               "frr defaults traditional", f"hostname {d['frr_hostname']}", "log stdout", "!"]
         for name, i in d["ifaces"].items():
             if i["desc"] or i["down"]:
                 out.append(f"interface {name}")
@@ -41,7 +41,10 @@ class FakeLab:
                 if i["down"]:
                     out.append(" shutdown")
                 out += ["exit", "!"]
-        out += ["router bgp 65101", " bgp router-id 10.255.0.2", "exit", "!", "end"]
+        out += ["router bgp 65101", " bgp router-id 10.255.0.2", "exit", "!"]
+        if d["hostname"] != d["frr_hostname"]:          # real FRR: a fresh vtysh adds its own (OS) hostname line
+            out.append(f"hostname {d['hostname']}")
+        out.append("end")
         return "\n".join(out)
 
     def run(self, cmd, capture_output=True, text=True, timeout=20):
@@ -51,6 +54,14 @@ class FakeLab:
         if self.lab_down:
             return res(1, "", f"Error response from daemon: No such container: {cmd[2]}")
         d = self.devices[dev]
+        if cmd[3] == "hostname":                             # the container's own hostname
+            if len(cmd) == 4:
+                return res(0, d["hostname"] + "\n")
+            if self.reject:
+                return res(1, "", "hostname: you must be root to change the host name")
+            if not self.ignore_changes:
+                d["hostname"] = cmd[4]
+            return res(0, "")
         if cmd[3] == "ip":                                   # ip -br link show ethN
             i = d["ifaces"][cmd[-1]]
             return res(0, f"{cmd[-1]}@if23  {'DOWN' if i['down'] else 'UP'}  aa:bb:cc:dd:ee:ff <BROADCAST>\n")
@@ -64,8 +75,7 @@ class FakeLab:
             if a == "configure terminal":
                 continue
             if a.startswith("hostname "):
-                if not self.ignore_changes:
-                    d["hostname"] = a.split(" ", 1)[1]
+                pass          # real FRR: vtysh's own `hostname` only renames that one session, nothing persists
             elif a.startswith("interface "):
                 cur = a.split(" ", 1)[1]
             elif cur and a.startswith("description "):
@@ -131,7 +141,10 @@ class ConfigToolTests(unittest.TestCase):
         r = self.propose(device="leaf1", action="hostname", value="BranchA")
         a = ct.apply_change(r["change_id"], self.turn(2))
         self.assertEqual(a["status"], "verified")
-        self.assertEqual(a["evidence"], {"hostname_before": "leaf1", "hostname_after": "BranchA"})
+        self.assertEqual(a["evidence"], {"hostname_before": "leaf1", "hostname_after": "BranchA", "vtysh_shows": "BranchA"})
+        # real FRR keeps the saved config name until redeploy; the agent must not pretend otherwise
+        self.assertEqual(self.lab.devices["leaf1"]["frr_hostname"], "leaf1")
+        self.assertIn("docker exec clab-dc01-leaf1 hostname BranchA", r["commands_that_will_run"])
         self.assertEqual([e["event"] for e in self.audit()], ["proposed", "applied"])
         self.assertTrue(self.audit()[-1]["verified"])
 

@@ -19,7 +19,7 @@ leaves (leaf1, leaf2) and two hosts (host1, host2). You can read the network and
 four kinds of change to the routers, nothing else.
 
 WHAT YOU CAN CHANGE (routers only; hosts cannot be configured):
-  1. hostname      - the FRR hostname of spine1, leaf1 or leaf2
+  1. hostname      - the hostname of spine1, leaf1 or leaf2 (the router container hostname shown at the vtysh prompt)
   2. description   - the description of interface eth1 or eth2
   3. shutdown      - shut down eth1 or eth2
   4. no_shutdown   - bring eth1 or eth2 back up

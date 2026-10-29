@@ -108,6 +108,17 @@ def _read_config(device: str) -> dict:
     return cfg
 
 
+def _os_hostname(device: str) -> str:
+    """The router container's own hostname (what the `hostname` command prints).
+
+    Real FRR: `hostname X` typed in vtysh only renames that one vtysh session; the daemons keep the name from
+    frr.conf. The name an operator actually sees at a fresh vtysh prompt comes from the container's hostname,
+    so that is what this agent changes and reads back.
+    """
+    res = _run(["docker", "exec", _container(device), "hostname"])
+    return res["output"].strip() if res["ok"] else ""
+
+
 def _link_state(device: str, interface: str) -> str:
     """Operational state from the kernel (UP / DOWN), independent of FRR's config."""
     res = _run(["docker", "exec", _container(device), "ip", "-br", "link", "show", interface])
@@ -186,8 +197,11 @@ def propose_change(device: str, action: str, tool_context, interface: str = "", 
 
     iface = cfg["interfaces"].get(interface, {"description": None, "shutdown": False}) if interface else {}
     if action == "hostname":
-        previous, change_text = cfg["hostname"], f"rename {device}'s FRR hostname from '{cfg['hostname']}' to '{value}'"
-        no_change = cfg["hostname"] == value
+        previous = _os_hostname(device)
+        if not previous:
+            return {"status": "error", "error": f"could not read the hostname of {device}. Is the lab running?"}
+        change_text = f"rename {device}'s hostname from '{previous}' to '{value}'"
+        no_change = previous == value
     elif action == "description":
         previous = iface.get("description")
         change_text = f"set the description of {device} {interface} to '{value}' (currently: {previous!r})"
@@ -211,11 +225,15 @@ def propose_change(device: str, action: str, tool_context, interface: str = "", 
         risk = "HIGH"
         impact = f"{interface} is {role}. Shutting it down will drop that link and anything that depends on it."
     elif action == "hostname":
-        impact = "Changes the name shown in the FRR prompt and configuration only. The Docker container name (clab-dc01-...) does not change, so the monitoring tools still work."
+        impact = ("Changes the router's hostname (the `hostname` command and the vtysh prompt). The Docker container name "
+                  "(clab-dc01-...) does not change, so the monitoring tools still work. FRR's saved config still says the "
+                  "old name until the lab is redeployed.")
     elif action == "no_shutdown":
         impact = "Restores the link. BGP may take 10-30 seconds to re-establish."
 
     commands = _commands_for(action, interface, value)
+    if action == "hostname":
+        commands = [f"docker exec {_container(device)} hostname {value}"]
     change = {
         "id": uuid.uuid4().hex[:6],
         "device": device, "action": action, "interface": interface, "value": value,
@@ -233,7 +251,7 @@ def propose_change(device: str, action: str, tool_context, interface: str = "", 
         "change_id": change["id"],
         "summary": change_text,
         "device": device, "current_value": previous, "risk": risk, "impact": impact,
-        "commands_that_will_run": commands[1:],
+        "commands_that_will_run": commands if action == "hostname" else commands[1:],
         "expires_in_seconds": PENDING_TTL_SECONDS,
         "instruction": "Show this summary to the user and ask them to reply yes or no. Do NOT call apply_change in this turn.",
     }
@@ -265,9 +283,12 @@ def apply_change(change_id: str, tool_context) -> dict:
     device, action, interface, value = pending["device"], pending["action"], pending["interface"], pending["value"]
 
     # ---- execute
-    cmd = ["docker", "exec", _container(device), "vtysh"]
-    for c in pending["commands"]:
-        cmd += ["-c", c]
+    if action == "hostname":
+        cmd = ["docker", "exec", _container(device), "hostname", value]
+    else:
+        cmd = ["docker", "exec", _container(device), "vtysh"]
+        for c in pending["commands"]:
+            cmd += ["-c", c]
     res = _run(cmd)
     tool_context.state[PENDING_KEY] = None            # one use only
     errors = _vtysh_errors(res["output"])
@@ -281,8 +302,9 @@ def apply_change(change_id: str, tool_context) -> dict:
     evidence, ok = {}, False
     if after["ok"]:
         if action == "hostname":
-            evidence = {"hostname_before": pending["previous"], "hostname_after": after["hostname"]}
-            ok = after["hostname"] == value
+            now = _os_hostname(device)
+            evidence = {"hostname_before": pending["previous"], "hostname_after": now, "vtysh_shows": after["hostname"]}
+            ok = now == value and after["hostname"] == value
         else:
             ai = after["interfaces"].get(interface, {"description": None, "shutdown": False})
             link = _link_state(device, interface)
